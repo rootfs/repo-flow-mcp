@@ -1,0 +1,14 @@
+stages:
+  - build
+  - test
+
+build_job:
+  stage: build
+  script:
+    - bash scripts/train.sh
+
+test_job:
+  stage: test
+  needs: [build_job]
+  script:
+    - python scripts/publish.py --input dist/app.tar.gz

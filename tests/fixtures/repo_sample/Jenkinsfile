@@ -1,0 +1,15 @@
+pipeline {
+  agent any
+  stages {
+    stage('Build') {
+      steps {
+        sh 'make build'
+      }
+    }
+    stage('Test') {
+      steps {
+        sh 'python scripts/publish.py --input dist/app.tar.gz'
+      }
+    }
+  }
+}

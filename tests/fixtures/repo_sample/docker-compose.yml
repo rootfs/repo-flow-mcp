@@ -1,0 +1,7 @@
+services:
+  api:
+    image: sample/api:latest
+    depends_on:
+      - redis
+  redis:
+    image: redis:7
