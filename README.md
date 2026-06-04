@@ -117,6 +117,24 @@ module-internal or newly introduced. Agents should report this as evidence
 ("symbol X is not referenced outside the changed files"), not retry with
 broader queries.
 
+### For PR review, point `path` at a post-patch worktree
+
+If you are localizing for a PR review, the symbols you care about most are the
+ones the PR *adds*. The base checkout does not contain them yet, so the graph
+(and `grep`) will correctly return zero for every newly introduced name. Set
+up a detached `git worktree` at the PR's head SHA and pass that path:
+
+```bash
+git fetch origin pull/<N>/head
+git worktree add --detach /tmp/review-wt-<N> <head_sha>
+# call repo_localizer / code_localizer_function_to_script_batch with path=/tmp/review-wt-<N>
+git worktree remove --force /tmp/review-wt-<N>
+```
+
+This is harness-side work — the MCP server has no notion of PRs. Without it,
+"new symbol" localization looks like a tool failure when in fact the working
+tree is missing the symbol's definition.
+
 ### Frame agent prompts as **extraction** questions, not topical ones
 
 A diff alone can answer "what does this change do". It cannot answer:
