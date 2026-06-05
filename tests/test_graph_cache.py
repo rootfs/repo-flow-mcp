@@ -45,9 +45,26 @@ def test_get_graph_invalidates_on_mtime_change(tmp_path: Path) -> None:
     target = repo / "main.py"
     future = time.time() + 5
     os.utime(target, (future, future))
+    # The watcher delivers events asynchronously through inotify; give
+    # the observer thread a chance to mark the entry dirty before we
+    # query again.
+    _wait_for_dirty(str(repo))
 
     g2 = get_graph(str(repo))
     assert g1 is not g2
+
+
+def _wait_for_dirty(path: str, timeout: float = 2.0) -> None:
+    """Spin until the watcher reports the cached entry as dirty."""
+    from repo_flow_mcp.graph_cache import _cache  # noqa: PLC0415
+
+    deadline = time.time() + timeout
+    resolved = str(Path(path).resolve())
+    while time.time() < deadline:
+        for (root, _flag), entry in list(_cache.items()):
+            if root == resolved and entry.watcher._dirty:
+                return
+        time.sleep(0.05)
 
 
 def test_get_graph_evicts_lru_entries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

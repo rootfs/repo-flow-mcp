@@ -4,6 +4,7 @@ from collections import deque
 from pathlib import Path
 
 from repo_flow_mcp.models import EdgeKind, GraphDocument
+from repo_flow_mcp.symbol_index import SymbolIndex
 from repo_flow_mcp.parsers import (
     parse_bazel_build,
     parse_cmake,
@@ -266,7 +267,12 @@ def repo_entrypoints(graph: GraphDocument, limit: int = 50) -> dict[str, object]
     }
 
 
-def function_to_script_chains(graph: GraphDocument, function_query: str, limit: int = 10) -> dict[str, object]:
+def function_to_script_chains(
+    graph: GraphDocument,
+    function_query: str,
+    limit: int = 10,
+    symbol_index: SymbolIndex | None = None,
+) -> dict[str, object]:
     query = function_query.strip().lower()
     if not query:
         return {"query": function_query, "matches": []}
@@ -281,12 +287,32 @@ def function_to_script_chains(graph: GraphDocument, function_query: str, limit: 
         if edge.kind.value == "invokes" and edge.target.startswith("script:"):
             invocations.append((edge.source, edge.target, edge.metadata.get("command", "")))
 
+    # Pick candidate symbols using the FTS5 index when available; fall
+    # back to a full scan if the index is missing or returns nothing
+    # (e.g. for a query that doesn't tokenize cleanly). The fallback
+    # preserves the original substring-match semantics.
+    candidate_ids: list[str] = []
+    if symbol_index is not None:
+        candidate_ids = [
+            sid for sid in symbol_index.search(function_query, limit=max(limit * 4, 64))
+            if sid in defines_file_for_symbol
+        ]
+    if not candidate_ids:
+        candidate_ids = [
+            sid for sid in defines_file_for_symbol
+            if (
+                query in (node_by_id[sid].label.lower() if sid in node_by_id else "")
+                or query in sid.lower()
+            )
+        ]
+
     results: list[dict[str, object]] = []
-    for symbol_id, file_path in defines_file_for_symbol.items():
+    for symbol_id in candidate_ids:
+        file_path = defines_file_for_symbol.get(symbol_id)
+        if file_path is None:
+            continue
         symbol = node_by_id.get(symbol_id)
         if not symbol:
-            continue
-        if query not in symbol.label.lower() and query not in symbol_id.lower():
             continue
 
         basename = Path(file_path).name

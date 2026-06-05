@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Annotated
 
 from mcp.server.fastmcp import FastMCP
@@ -14,7 +15,7 @@ from repo_flow_mcp.graph_builder import (
     repo_overview,
     shortest_path,
 )
-from repo_flow_mcp.graph_cache import get_graph
+from repo_flow_mcp.graph_cache import get_doc_index, get_graph, get_symbol_index
 from repo_flow_mcp.interfaces import (
     CodeLocalizerFunctionToScriptResponse,
     CodeLocalizerNeighborhoodResponse,
@@ -137,7 +138,13 @@ def code_localizer_function_to_script(
     ] = 10,
 ) -> dict[str, object]:
     graph = get_graph(path)
-    payload = function_to_script_chains(graph, function_query=function_query, limit=max(1, limit))
+    index = get_symbol_index(path)
+    payload = function_to_script_chains(
+        graph,
+        function_query=function_query,
+        limit=max(1, limit),
+        symbol_index=index,
+    )
     return CodeLocalizerFunctionToScriptResponse.model_validate(payload).model_dump()
 
 
@@ -300,6 +307,7 @@ def code_localizer_function_to_script_batch(
     ] = 60,
 ) -> dict[str, object]:
     graph = get_graph(path)
+    index = get_symbol_index(path)
     results: list[dict[str, object]] = []
     total = 0
     truncated = False
@@ -315,7 +323,10 @@ def code_localizer_function_to_script_batch(
             break
         per_query_limit = min(max(1, limit_per_query), remaining)
         payload = function_to_script_chains(
-            graph, function_query=query, limit=per_query_limit
+            graph,
+            function_query=query,
+            limit=per_query_limit,
+            symbol_index=index,
         )
         validated = CodeLocalizerFunctionToScriptResponse.model_validate(payload).model_dump()
         matches = validated.get("matches") or []
@@ -370,6 +381,159 @@ def code_localizer_node_context_batch(
         validated = CodeLocalizerNeighborhoodResponse.model_validate(payload).model_dump()
         results.append({"node_id": node_id, "neighborhood": validated})
     return {"queries": len(results), "results": results}
+
+
+@mcp.tool(
+    description=(
+        "BM25 full-text search over the repo's documentation prose (markdown / "
+        "mdx / rst / txt), one row per heading-delimited section. Use this for "
+        "DOCS-only review questions that grep can't rank: \"which existing pages "
+        "discuss the same concepts as this new doc\", \"which sibling pages "
+        "should cross-link to a renamed section\", \"where else is term X "
+        "explained\". Returns each hit as path + section title + start_line + "
+        "snippet + bm25 score (lower is better). For literal-token lookups "
+        "(exact paths, exact identifier names) prefer plain `grep` — BM25 "
+        "doesn't add value there."
+    )
+)
+def doc_localizer_related_pages(
+    path: Annotated[str, Field(description=_PATH_DESC)],
+    query: Annotated[
+        str,
+        Field(
+            description="Free-text query (e.g. a section title, a paragraph, or a list of related terms). Tokens are stemmed (porter) so 'calibrate' matches 'calibration'.",
+            min_length=1,
+            max_length=2000,
+        ),
+    ],
+    limit: Annotated[
+        int,
+        Field(
+            description="Top-k passages to return, ranked by BM25.",
+            ge=1,
+            le=50,
+        ),
+    ] = 10,
+    path_glob: Annotated[
+        str | None,
+        Field(
+            description="Optional SQLite GLOB to scope results (e.g. 'docs/*.md', 'website/docs/**/*.mdx'). Omit to search the whole repo.",
+        ),
+    ] = None,
+) -> dict[str, object]:
+    docs = get_doc_index(path)
+    matches = docs.search(query, limit=max(1, limit), path_glob=path_glob)
+    return {"query": query, "matches": matches}
+
+
+@mcp.tool(
+    description=(
+        "Resolve a relative doc link (e.g. `./embedding-design-principles`, "
+        "`../config/foo.yaml`) against the repo's path set. Returns whether "
+        "the target exists and the canonical repo-relative path it resolves "
+        "to. Use this to verify cross-links in a docs-PR before approving — "
+        "catches broken `[text](path)` references that markdownlint won't."
+    )
+)
+def doc_localizer_anchor_resolve(
+    path: Annotated[str, Field(description=_PATH_DESC)],
+    source_file: Annotated[
+        str,
+        Field(
+            description="Repo-relative path of the file containing the link (used to resolve relative targets).",
+            examples=["website/docs/tutorials/embedding.md"],
+        ),
+    ],
+    target: Annotated[
+        str,
+        Field(
+            description="Link target as written in the source file (e.g. './embedding-design-principles', '../foo.yaml', '/website/docs/x'). Trailing anchors (#...) are stripped before resolving.",
+            min_length=1,
+            max_length=500,
+        ),
+    ],
+) -> dict[str, object]:
+    docs = get_doc_index(path)
+    repo_root = Path(path).resolve()
+
+    raw = target.split("#", maxsplit=1)[0].strip()
+    if not raw:
+        return {"resolved": False, "reason": "empty target", "candidates": []}
+
+    src_dir = Path(source_file).parent
+    if raw.startswith("/"):
+        candidate = Path(raw.lstrip("/"))
+    else:
+        candidate = (src_dir / raw)
+
+    # Normalize without touching the filesystem so the answer is
+    # deterministic for missing files too.
+    try:
+        normalized = candidate.as_posix()
+        normalized_path = Path(normalized)
+        parts: list[str] = []
+        for part in normalized_path.parts:
+            if part == "..":
+                if parts:
+                    parts.pop()
+            elif part == "." or part == "":
+                continue
+            else:
+                parts.append(part)
+        normalized = "/".join(parts)
+    except ValueError:
+        return {"resolved": False, "reason": "invalid path", "candidates": []}
+
+    # Direct hit, then a few common docs-suffix expansions for
+    # extension-less wiki-style links.
+    candidates: list[str] = [normalized]
+    if "." not in Path(normalized).name:
+        candidates.extend(
+            f"{normalized}{ext}" for ext in (".md", ".mdx", ".rst", "/index.md")
+        )
+
+    for cand in candidates:
+        if docs.has_path(cand):
+            return {
+                "resolved": True,
+                "canonical": cand,
+                "exists_on_disk": (repo_root / cand).exists(),
+                "candidates": candidates,
+            }
+    return {
+        "resolved": False,
+        "reason": "no path matched",
+        "candidates": candidates,
+    }
+
+
+@mcp.tool(
+    description=(
+        "Find every doc section that mentions a term, ranked by BM25. Like "
+        "`grep -n term docs/`, but section-aware: hits land on the heading "
+        "that owns the line, with a highlighted snippet. Use this for terms "
+        "that have many matches (acronyms, product names, config keys) where "
+        "a flat grep dump is too noisy."
+    )
+)
+def doc_localizer_term_usage(
+    path: Annotated[str, Field(description=_PATH_DESC)],
+    term: Annotated[
+        str,
+        Field(
+            description="Term or short phrase to look up. Stemmed via porter.",
+            min_length=1,
+            max_length=200,
+        ),
+    ],
+    limit: Annotated[
+        int,
+        Field(description="Max sections to return.", ge=1, le=100),
+    ] = 20,
+) -> dict[str, object]:
+    docs = get_doc_index(path)
+    matches = docs.search(term, limit=max(1, limit))
+    return {"term": term, "matches": matches}
 
 
 def run_server() -> None:

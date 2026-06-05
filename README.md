@@ -104,11 +104,17 @@ inside the batch, so latency stays close to a single call.
 
 ### Use a stable absolute `path` to hit the graph cache
 
-The server keeps an LRU of recently built repo graphs (invalidated on file
-mtime). First call against a repo is the expensive one (build); subsequent
-calls return in milliseconds. Always pass the **same absolute repo root** in
-`path` across calls within an agent turn — different relative paths or symlink
-variants will miss the cache and rebuild.
+The server keeps an LRU of recently built repo graphs. The first call against a
+repo is the expensive one (build); subsequent calls return in milliseconds. A
+filesystem watcher (watchdog) flips the cache to dirty as soon as any
+non-ignored file under the repo changes, so the next call rebuilds — there is
+no per-call mtime walk. Each cached graph also pairs with an in-memory SQLite
+FTS5 symbol index, so `code_localizer_function_to_script*` resolves a query
+through an inverted index rather than scanning every symbol.
+
+Always pass the **same absolute repo root** in `path` across calls within an
+agent turn — different relative paths or symlink variants will miss the cache
+and rebuild.
 
 ### Zero matches is a signal, not a failure
 
