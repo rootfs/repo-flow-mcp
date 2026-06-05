@@ -108,7 +108,11 @@ def repo_localizer_entrypoints(
         "that invoke it (directly or through file bridges). Use this for change-impact "
         "questions like \"where is X actually called from in production?\" or to find "
         "the runbook path for a symbol. Replaces multi-step grep + view + bash chains: "
-        "one call returns code-symbol → file → script/workflow chains with line numbers."
+        "one call returns code-symbol → file → script/workflow chains with line numbers. "
+        "\n\nSCOPE: only function, method, and class/type names with a body are indexed. "
+        "Struct fields, interface members, top-level const/var, type aliases, and any "
+        "plain identifier that is not the name of a defined function are NOT in the graph "
+        "and will return 0 matches — fall back to `grep` for those."
     )
 )
 def code_localizer_function_to_script(
@@ -257,7 +261,11 @@ def explain_runbook_path(
         "single-symbol calls when reviewing a PR that changes multiple symbols. Builds the "
         "graph once (cached across calls in the same session) and returns one entry per "
         "query, with a global cap on total chains so the response stays bounded for large "
-        "PRs (dozens of changed symbols)."
+        "PRs (dozens of changed symbols). "
+        "\n\nSCOPE: same as the single-symbol variant — only function, method, and "
+        "class/type names with a body are indexed. Struct fields, interface members, "
+        "top-level const/var, type aliases, and renamed identifiers that are not function "
+        "definitions will return 0 matches; fall back to `grep` for those queries."
     )
 )
 def code_localizer_function_to_script_batch(
