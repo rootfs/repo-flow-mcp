@@ -23,14 +23,14 @@ from pathlib import Path
 import pytest
 
 from repo_flow_mcp.graph_cache import clear_cache
-from repo_flow_mcp.server import code_localizer, doc_localizer, repo_localizer
-
-from ._helpers import (
-    PullRequest,
-    apply_diff,
-    clone_repo_at,
-    fetch_pull_request,
+from repo_flow_mcp.server import (
+    code_localizer,
+    doc_localizer,
+    pr_workspace,
+    repo_localizer,
 )
+
+from ._helpers import PullRequest, fetch_pull_request
 
 
 # Each case: (repo_url, pr_number, kind) where ``kind`` controls which
@@ -49,15 +49,21 @@ def _reset_cache() -> None:
 
 
 def _materialize_pr(
-    repo_url: str, pr_number: int, tmp_path: Path
+    repo_url: str, pr_number: int
 ) -> tuple[PullRequest, Path]:
-    """Clone the repo at the PR's base SHA and apply the PR's diff."""
+    """Resolve a PR and have ``pr_workspace`` materialize its working tree.
+
+    Uses the new MCP tool surface end-to-end — no test-side clone/apply,
+    so this also exercises the shared worktree + overlay caches.
+    """
 
     pr = fetch_pull_request(repo_url, pr_number)
-    repo_dir = tmp_path / "repo"
-    clone_repo_at(repo_url, pr.base_sha, repo_dir)
-    apply_diff(repo_dir, pr.diff_text)
-    return pr, repo_dir
+    workspace = pr_workspace(
+        repo_url=repo_url,
+        base_sha=pr.base_sha,
+        diff_text=pr.diff_text,
+    )
+    return pr, Path(str(workspace["worktree_path"]))
 
 
 @pytest.mark.e2e
@@ -65,7 +71,7 @@ def _materialize_pr(
 def test_pr_workflow_drives_mcp(
     repo_url: str, pr_number: int, kind: str, tmp_path: Path
 ) -> None:
-    pr, repo_dir = _materialize_pr(repo_url, pr_number, tmp_path)
+    pr, repo_dir = _materialize_pr(repo_url, pr_number)
 
     # --- repo_localizer / overview --------------------------------------
     overview = repo_localizer(path=str(repo_dir), view="overview")

@@ -431,5 +431,118 @@ def doc_localizer(
     return {"op": "resolve_link", **payload}
 
 
+# ---------------------------------------------------------------------------
+# Tool 4: pr_workspace — materialize a PR's working tree on disk
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool(
+    description=(
+        "Materialize a PR's working tree on disk and return its path so the "
+        "other localizer tools can be pointed at it. Backed by the shared "
+        "worktree + graph cache, so a re-run for the same (repo, base_sha) "
+        "is ~free and a re-run for the exact same (repo, base_sha, diff) "
+        "also reuses the previously built graph.\n\n"
+        "Workflow:\n"
+        "  1. Fetch / reuse the base tree at ``base_sha`` (tarball when the "
+        "remote is github.com, ``git clone`` otherwise).\n"
+        "  2. CoW-copy it into a scratch directory (reflink when supported).\n"
+        "  3. Apply ``diff_text`` with ``git apply`` (skipped when empty).\n"
+        "  4. Return the resulting path.\n\n"
+        "Callers can then issue ``repo_localizer(path=...)`` / "
+        "``code_localizer(path=...)`` / ``doc_localizer(path=...)`` against "
+        "the returned path. The worktree persists across calls until LRU "
+        "eviction; don't delete it manually."
+    )
+)
+def pr_workspace(
+    repo_url: Annotated[
+        str,
+        Field(
+            description="HTTPS or SSH URL of the remote, e.g. https://github.com/owner/repo.git.",
+        ),
+    ],
+    base_sha: Annotated[
+        str,
+        Field(
+            description="The full 40-char commit SHA the PR is branched from.",
+            min_length=12,
+            max_length=40,
+        ),
+    ],
+    diff_text: Annotated[
+        str,
+        Field(
+            description="Unified-diff text to apply on top of ``base_sha``. Pass an empty string to materialize the base tree only.",
+        ),
+    ] = "",
+) -> dict[str, object]:
+    from repo_flow_mcp import worktree_cache
+    from repo_flow_mcp.graph_persistence import _cache_root
+    import hashlib
+    import subprocess
+
+    base = worktree_cache.get_base_worktree(repo_url, base_sha)
+    diff_text = diff_text or ""
+
+    if not diff_text.strip():
+        return {
+            "worktree_path": str(base),
+            "base_sha": base_sha,
+            "diff_sha": None,
+            "applied_diff": False,
+        }
+
+    # The overlay scratch dir is keyed by (base_sha, diff_sha) so two
+    # callers with the same payload share a single materialization.
+    diff_sha = hashlib.sha256(diff_text.encode("utf-8")).hexdigest()[:16]
+    scratch = _cache_root() / "overlays" / f"{base_sha[:12]}-{diff_sha}"
+
+    if not (scratch / ".repo_flow_overlay_complete").exists():
+        worktree_cache.materialize_overlay(base, scratch)
+        proc = subprocess.run(
+            ["git", "apply", "--whitespace=nowarn", "-"],
+            cwd=str(scratch),
+            input=diff_text,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            # Initialize a tiny git repo so --3way can run, then retry.
+            subprocess.run(
+                ["git", "init", "-q"], cwd=str(scratch), check=False, capture_output=True
+            )
+            subprocess.run(
+                ["git", "add", "-A"], cwd=str(scratch), check=False, capture_output=True
+            )
+            subprocess.run(
+                ["git", "-c", "user.email=mcp@invalid", "-c", "user.name=mcp", "commit", "-q", "-m", "base"],
+                cwd=str(scratch),
+                check=False,
+                capture_output=True,
+            )
+            proc = subprocess.run(
+                ["git", "apply", "--3way", "--whitespace=nowarn", "-"],
+                cwd=str(scratch),
+                input=diff_text,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"failed to apply diff to overlay: {(proc.stderr or proc.stdout).strip()}"
+                )
+        (scratch / ".repo_flow_overlay_complete").write_text(diff_sha, encoding="utf-8")
+
+    return {
+        "worktree_path": str(scratch),
+        "base_sha": base_sha,
+        "diff_sha": diff_sha,
+        "applied_diff": True,
+    }
+
+
 def run_server() -> None:
     mcp.run()

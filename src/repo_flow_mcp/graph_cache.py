@@ -25,11 +25,13 @@ so we don't leak threads or file descriptors.
 from __future__ import annotations
 
 import atexit
+import os
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 
+from repo_flow_mcp import graph_persistence
 from repo_flow_mcp.doc_index import DocIndex
 from repo_flow_mcp.graph_builder import build_graph
 from repo_flow_mcp.models import GraphDocument
@@ -104,7 +106,30 @@ def _build_entry(path: Path, include_hidden: bool) -> RepoEntry:
             ignore_dirs=settings.ignore_dirs,
             scan_exts=settings.scan_exts,
         )
-    graph = build_graph(str(path), include_hidden=include_hidden)
+    # Try the on-disk graph cache first. The key is content-addressed,
+    # so any two worktrees with identical files share a hit. The hash
+    # walk is itself an rglob+read of the whole tree, so we only use it
+    # when the in-process cache already missed.
+    graph: GraphDocument | None = None
+    if os.getenv("REPO_FLOW_DISK_CACHE", "1") not in {"0", "false", ""}:
+        try:
+            key = graph_persistence.compute_worktree_key(
+                path, include_hidden=include_hidden, settings=settings
+            )
+            graph = graph_persistence.read(key)
+        except Exception:
+            # Cache is best-effort; never fail a build because of it.
+            graph = None
+            key = None
+    else:
+        key = None
+    if graph is None:
+        graph = build_graph(str(path), include_hidden=include_hidden)
+        if key is not None:
+            try:
+                graph_persistence.write(key, graph)
+            except Exception:
+                pass
     index = SymbolIndex.from_graph(graph)
     rel_paths = _walk_repo_paths(path, settings)
     docs = DocIndex.from_root(path, rel_paths)
