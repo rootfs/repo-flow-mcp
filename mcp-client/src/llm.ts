@@ -1,26 +1,85 @@
-import OpenAI from "openai";
-import type {
-    ChatCompletion,
-    ChatCompletionMessageParam,
-    ChatCompletionMessageToolCall,
-    ChatCompletionTool,
-} from "openai/resources/chat/completions.mjs";
+import { generateText, jsonSchema, tool as aiTool } from "ai";
+import type { CoreMessage, LanguageModelV1, ToolSet } from "ai";
+import { createOpenAI } from "@ai-sdk/openai";
+import { createAzure } from "@ai-sdk/azure";
 import type { McpSession, McpToolDef } from "./mcp.js";
 
+export interface AzureConfig {
+    /** Full endpoint, e.g. https://my-resource.openai.azure.com */
+    endpoint: string;
+    /** Deployment name (Azure-side name, not the underlying model id). */
+    deployment: string;
+    /** API version, e.g. 2024-10-21. */
+    apiVersion: string;
+}
+
 export interface LlmConfig {
-    /** OpenAI-compatible base URL. Default: GitHub Models. */
-    baseUrl: string;
-    /** API key (env-resolved upstream). */
+    /** Provider selector. */
+    provider: "openai" | "azure";
+    /** API key. */
     apiKey: string;
-    /** Model identifier. */
+    /**
+     * Model id. For Azure this must match the deployment name; for OpenAI-compatible
+     * endpoints (incl. GitHub Models) it's the served model id.
+     */
     model: string;
-    /** Optional max output tokens; some endpoints require it. */
+    /** Base URL for the OpenAI-compatible provider. Ignored when provider==='azure'. */
+    baseUrl?: string;
+    /** Azure-specific settings. Required when provider==='azure'. */
+    azure?: AzureConfig;
+    /** Optional max output tokens. */
     maxOutputTokens?: number;
-    /** Optional temperature. */
+    /** Optional sampling temperature. */
     temperature?: number;
 }
 
 export function resolveLlmConfig(overrides: Partial<LlmConfig> = {}): LlmConfig {
+    const azureEndpoint =
+        overrides.azure?.endpoint ??
+        process.env.AZURE_OPENAI_ENDPOINT ??
+        process.env.AZURE_ENDPOINT;
+    const azureDeployment =
+        overrides.azure?.deployment ??
+        process.env.AZURE_OPENAI_DEPLOYMENT ??
+        process.env.AZURE_DEPLOYMENT ??
+        overrides.model ??
+        process.env.MCP_REVIEW_LLM_MODEL;
+    const azureApiVersion =
+        overrides.azure?.apiVersion ??
+        process.env.AZURE_OPENAI_API_VERSION ??
+        process.env.AZURE_API_VERSION ??
+        "2024-10-21";
+    const wantsAzure = overrides.provider === "azure" || Boolean(azureEndpoint);
+
+    if (wantsAzure) {
+        if (!azureEndpoint) {
+            throw new Error("Azure OpenAI requested but no endpoint found. Set AZURE_OPENAI_ENDPOINT (or AZURE_ENDPOINT).");
+        }
+        if (!azureDeployment) {
+            throw new Error("Azure OpenAI requested but no deployment found. Set AZURE_OPENAI_DEPLOYMENT (or AZURE_DEPLOYMENT) or pass --model.");
+        }
+        const apiKey =
+            // Azure-specific key sources win; we deliberately do not pick `overrides.apiKey`
+            // here so a caller-provided GitHub token doesn't get sent to Azure as the api-key.
+            process.env.AZURE_OPENAI_API_KEY ??
+            process.env.AZURE_API_KEY ??
+            process.env.API_KEY ??
+            process.env.MCP_REVIEW_LLM_API_KEY ??
+            "";
+        if (!apiKey) {
+            throw new Error("Azure OpenAI requested but no API key found. Set AZURE_OPENAI_API_KEY (or API_KEY).");
+        }
+        const out: LlmConfig = {
+            provider: "azure",
+            apiKey,
+            model: azureDeployment,
+            azure: { endpoint: azureEndpoint, deployment: azureDeployment, apiVersion: azureApiVersion },
+        };
+        if (overrides.maxOutputTokens !== undefined) out.maxOutputTokens = overrides.maxOutputTokens;
+        if (overrides.temperature !== undefined) out.temperature = overrides.temperature;
+        return out;
+    }
+
     const baseUrl =
         overrides.baseUrl ??
         process.env.MCP_REVIEW_LLM_BASE_URL ??
@@ -46,26 +105,32 @@ export function resolveLlmConfig(overrides: Partial<LlmConfig> = {}): LlmConfig 
             "When using the GitHub Models endpoint (default), a GITHUB_TOKEN with `models:read` is sufficient.",
         );
     }
-    const out: LlmConfig = { baseUrl, apiKey, model };
+    const out: LlmConfig = { provider: "openai", apiKey, model, baseUrl };
     if (overrides.maxOutputTokens !== undefined) out.maxOutputTokens = overrides.maxOutputTokens;
     if (overrides.temperature !== undefined) out.temperature = overrides.temperature;
     return out;
 }
 
-export function makeLlm(cfg: LlmConfig): OpenAI {
-    return new OpenAI({ apiKey: cfg.apiKey, baseURL: cfg.baseUrl });
+// Azure endpoint shape varies; createAzure() wants either `resourceName` (which it expands to
+// https://{resourceName}.openai.azure.com/openai/deployments/...) or a `baseURL` already
+// pointing at /openai/deployments. Accept both forms in env input.
+function azureProviderArgs(cfg: AzureConfig, apiKey: string) {
+    const endpoint = cfg.endpoint.replace(/\/+$/, "");
+    const m = endpoint.match(/^https?:\/\/([^.\/]+)\.openai\.azure\.com$/);
+    const base = m
+        ? { resourceName: m[1] }
+        : { baseURL: endpoint.endsWith("/openai/deployments") ? endpoint : `${endpoint}/openai/deployments` };
+    return { apiKey, apiVersion: cfg.apiVersion, ...base };
 }
 
-/** Convert MCP tool definitions into OpenAI tool-call format. */
-export function mcpToolsToOpenAi(tools: McpToolDef[]): ChatCompletionTool[] {
-    return tools.map((t) => ({
-        type: "function" as const,
-        function: {
-            name: t.name,
-            description: t.description.slice(0, 1024),
-            parameters: t.inputSchema,
-        },
-    }));
+export function makeModel(cfg: LlmConfig): LanguageModelV1 {
+    if (cfg.provider === "azure") {
+        if (!cfg.azure) throw new Error("azure provider selected without azure config");
+        const azure = createAzure(azureProviderArgs(cfg.azure, cfg.apiKey));
+        return azure(cfg.azure.deployment);
+    }
+    const openai = createOpenAI({ apiKey: cfg.apiKey, baseURL: cfg.baseUrl });
+    return openai(cfg.model);
 }
 
 export interface ToolCallRecord {
@@ -98,106 +163,100 @@ export interface ChatWithToolsResult {
 }
 
 /**
- * Run a single LLM turn with iterative tool-use. Each round either yields
- * the assistant's final text (loop ends) or one-or-more tool_calls that
- * are dispatched through the MCP session and fed back into the next round.
- * The loop caps both iterations and per-tool result size to keep the
- * conversation bounded.
+ * Iterative tool-use turn delegated to the Vercel AI SDK. Each MCP tool is exposed
+ * as an AI-SDK tool whose `execute` dispatches into the MCP session; the SDK
+ * handles function-call parsing, scheduling, and message threading. We just cap
+ * step count and per-tool output size.
  */
-export async function chatWithTools(
-    opts: ChatWithToolsOptions,
-): Promise<ChatWithToolsResult> {
-    const llm = makeLlm(opts.cfg);
-    const openaiTools = mcpToolsToOpenAi(opts.tools);
-    const maxIter = opts.maxIterations ?? 12;
+export async function chatWithTools(opts: ChatWithToolsOptions): Promise<ChatWithToolsResult> {
+    const model = makeModel(opts.cfg);
     const cap = opts.toolResultCap ?? 8192;
-    const messages: ChatCompletionMessageParam[] = [];
-    if (opts.system) messages.push({ role: "system", content: opts.system });
-    messages.push({ role: "user", content: opts.user });
-
+    const maxSteps = opts.maxIterations ?? 12;
     const calls: ToolCallRecord[] = [];
 
-    for (let iter = 0; iter < maxIter; iter++) {
-        const params: Parameters<typeof llm.chat.completions.create>[0] = {
-            model: opts.cfg.model,
-            messages,
-            tools: openaiTools.length ? openaiTools : undefined,
-            tool_choice: openaiTools.length ? "auto" : undefined,
-        };
-        if (opts.cfg.maxOutputTokens) params.max_tokens = opts.cfg.maxOutputTokens;
-        if (opts.cfg.temperature !== undefined) params.temperature = opts.cfg.temperature;
+    // Azure OpenAI tool schemas are validated under strict mode; the API rejects any
+    // object schema that doesn't explicitly set `additionalProperties: false`.
+    // The generic OpenAI / GitHub-Models endpoint is lax about it, but normalizing
+    // doesn't hurt either side, so we always apply it.
+    const tools: ToolSet = Object.fromEntries(
+        opts.tools.map((t) => [
+            t.name,
+            aiTool({
+                description: t.description.slice(0, 1024),
+                parameters: jsonSchema(strictSchema(t.inputSchema) as Record<string, unknown>),
+                execute: async (args: unknown) => {
+                    const parsed = (args ?? {}) as Record<string, unknown>;
+                    const t0 = Date.now();
+                    let toolOut: { text: string; isError: boolean };
+                    try {
+                        toolOut = await opts.mcp.callTool(t.name, parsed);
+                    } catch (e) {
+                        toolOut = { text: `tool ${t.name} threw: ${(e as Error).message}`, isError: true };
+                    }
+                    const dur = Date.now() - t0;
+                    calls.push({
+                        tool: t.name,
+                        args: parsed,
+                        resultBytes: toolOut.text.length,
+                        durationMs: dur,
+                        isError: toolOut.isError,
+                    });
+                    opts.log(
+                        `  -> ${t.name}(${JSON.stringify(parsed).slice(0, 80)}) bytes=${toolOut.text.length} dur=${dur}ms${toolOut.isError ? " ERROR" : ""}`,
+                    );
+                    return toolOut.text.length > cap
+                        ? toolOut.text.slice(0, cap) + `\n... [truncated ${toolOut.text.length - cap} bytes]`
+                        : toolOut.text;
+                },
+            }),
+        ]),
+    );
 
-        const resp = (await llm.chat.completions.create(params)) as ChatCompletion;
-        const choice = resp.choices?.[0];
-        if (!choice) throw new Error("LLM returned no choices");
-        const msg = choice.message;
-        messages.push(msg as ChatCompletionMessageParam);
+    const messages: CoreMessage[] = [{ role: "user", content: opts.user }];
 
-        const toolCalls = (msg.tool_calls ?? []).filter(
-            (c: ChatCompletionMessageToolCall) => c.type === "function",
-        );
+    const result = await generateText({
+        model,
+        tools,
+        maxSteps,
+        ...(opts.system ? { system: opts.system } : {}),
+        messages,
+        ...(opts.cfg.maxOutputTokens ? { maxTokens: opts.cfg.maxOutputTokens } : {}),
+        ...(opts.cfg.temperature !== undefined ? { temperature: opts.cfg.temperature } : {}),
+        onStepFinish: ({ stepType, toolCalls, finishReason }) => {
+            opts.log(`step=${stepType} tool_calls=${toolCalls?.length ?? 0} finish=${finishReason}`);
+        },
+    });
 
-        if (!toolCalls.length) {
-            return { text: msg.content ?? "", toolCalls: calls };
-        }
+    return { text: result.text ?? "", toolCalls: calls };
+}
 
-        opts.log(
-            `iter=${iter + 1}/${maxIter} tool_calls=${toolCalls.length}`,
-        );
-
-        for (const tc of toolCalls) {
-            if (tc.type !== "function") continue;
-            const name = tc.function.name;
-            let parsed: Record<string, unknown> = {};
-            try {
-                parsed = JSON.parse(tc.function.arguments || "{}");
-            } catch {
-                parsed = { _raw: tc.function.arguments };
-            }
-            const t0 = Date.now();
-            let toolOut: { text: string; isError: boolean };
-            try {
-                toolOut = await opts.mcp.callTool(name, parsed);
-            } catch (e) {
-                toolOut = {
-                    text: `tool ${name} threw: ${(e as Error).message}`,
-                    isError: true,
-                };
-            }
-            const dur = Date.now() - t0;
-            const text =
-                toolOut.text.length > cap
-                    ? toolOut.text.slice(0, cap) + `\n... [truncated ${toolOut.text.length - cap} bytes]`
-                    : toolOut.text;
-            calls.push({
-                tool: name,
-                args: parsed,
-                resultBytes: toolOut.text.length,
-                durationMs: dur,
-                isError: toolOut.isError,
-            });
-            opts.log(
-                `  -> ${name}(${JSON.stringify(parsed).slice(0, 80)}) bytes=${toolOut.text.length} dur=${dur}ms${toolOut.isError ? " ERROR" : ""}`,
+/**
+ * Make a JSON Schema conformant with Azure OpenAI's strict tool-call validation:
+ * every object schema must set `additionalProperties: false` and list every
+ * property name in `required`. This loses the "optional" distinction, but the
+ * LLM simply ends up always providing every parameter (with sensible defaults
+ * picked from the description), which is fine for our MCP tools.
+ */
+function strictSchema(schema: unknown): unknown {
+    if (Array.isArray(schema)) return schema.map(strictSchema);
+    if (!schema || typeof schema !== "object") return schema;
+    const src = schema as Record<string, unknown>;
+    const out: Record<string, unknown> = { ...src };
+    if (out.type === "object") {
+        if (out.additionalProperties === undefined) out.additionalProperties = false;
+        if (out.properties && typeof out.properties === "object") {
+            const props = out.properties as Record<string, unknown>;
+            out.required = Object.keys(props);
+            out.properties = Object.fromEntries(
+                Object.entries(props).map(([k, v]) => [k, strictSchema(v)]),
             );
-            messages.push({
-                role: "tool",
-                tool_call_id: tc.id,
-                content: text,
-            });
         }
     }
-
-    opts.log(`hit iteration cap (${maxIter}); forcing a no-tools final turn`);
-    const finalResp = (await llm.chat.completions.create({
-        model: opts.cfg.model,
-        messages,
-        ...(opts.cfg.maxOutputTokens ? { max_tokens: opts.cfg.maxOutputTokens } : {}),
-        ...(opts.cfg.temperature !== undefined ? { temperature: opts.cfg.temperature } : {}),
-    })) as ChatCompletion;
-    return {
-        text: finalResp.choices?.[0]?.message?.content ?? "",
-        toolCalls: calls,
-    };
+    if (out.items !== undefined) out.items = strictSchema(out.items);
+    for (const key of ["anyOf", "oneOf", "allOf"] as const) {
+        if (Array.isArray(out[key])) out[key] = (out[key] as unknown[]).map(strictSchema);
+    }
+    return out;
 }
 
 /** Plain (no-tools) single-turn chat. */
@@ -206,16 +265,13 @@ export async function chatPlain(
     system: string | undefined,
     user: string,
 ): Promise<string> {
-    const llm = makeLlm(cfg);
-    const messages: ChatCompletionMessageParam[] = [];
-    if (system) messages.push({ role: "system", content: system });
-    messages.push({ role: "user", content: user });
-    const params: Parameters<typeof llm.chat.completions.create>[0] = {
-        model: cfg.model,
-        messages,
-    };
-    if (cfg.maxOutputTokens) params.max_tokens = cfg.maxOutputTokens;
-    if (cfg.temperature !== undefined) params.temperature = cfg.temperature;
-    const resp = (await llm.chat.completions.create(params)) as ChatCompletion;
-    return resp.choices?.[0]?.message?.content ?? "";
+    const model = makeModel(cfg);
+    const result = await generateText({
+        model,
+        ...(system ? { system } : {}),
+        prompt: user,
+        ...(cfg.maxOutputTokens ? { maxTokens: cfg.maxOutputTokens } : {}),
+        ...(cfg.temperature !== undefined ? { temperature: cfg.temperature } : {}),
+    });
+    return result.text ?? "";
 }
