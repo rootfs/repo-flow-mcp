@@ -193,9 +193,22 @@ export async function gatherRepoContext(
     const prFilenames = new Set(opts.files.map((f) => f.filename));
     opts.log(`changed-symbols=${changedSymbols.length}`);
 
+    // Build runner-friendly query candidates from the changed file paths.
+    // `code_localizer trace` matches on runner labels (Make targets, scripts,
+    // CI workflow/job/step) and on function names that runners invoke — NOT
+    // generic Go/TS function callers. So the highest-signal queries are:
+    //   - changed file basenames (often == script / target name)
+    //   - changed file path stems (e.g. `dashboard/backend/handlers/logs`)
+    //   - the changed code symbols themselves (low hit rate, kept for completeness)
+    const fileBasenames = Array.from(
+        new Set(opts.files.map((f) => f.filename.split("/").pop()!.replace(/\.[^.]+$/, ""))),
+    );
+    const traceCandidates = Array.from(new Set([...fileBasenames, ...changedSymbols])).slice(0, 50);
+
     const symbolsList = changedSymbols.length
         ? changedSymbols.map((s) => `  - ${s}`).join("\n")
-        : "  (none extracted — fall back to grep on the diff's added APIs)";
+        : "  (none extracted)";
+    const traceList = traceCandidates.map((s) => `  - ${s}`).join("\n");
 
     const DOC_EXT_RE = /\.(md|mdx|markdown|rst)$/i;
     const docFiles = opts.files.map((f) => f.filename).filter((n) => DOC_EXT_RE.test(n));
@@ -203,83 +216,65 @@ export async function gatherRepoContext(
     opts.log(`doc-files=${docFiles.length}`);
 
     const cwdJson = JSON.stringify(opts.cwd);
-    const codeToolBlock = [
-        "These answers CANNOT be inferred from the diff. They require lookup. Use the MCP tools listed in this turn — they are real and connected to the repo at the path above. Order:",
-        `  1. **code_localizer** with path=${cwdJson}, op="trace", queries=<all changed symbols>. ONE call covers every symbol. Try this FIRST.`,
-        `  2. If step 1 returns 0 matches for a symbol (common when newly introduced by this PR), fall back to **code_localizer** with op="context" for that symbol, or note the absence.`,
-        `  3. Only call **repo_localizer** (path=${cwdJson}, view="overview") if you actually need a hotspot map — it returns 5-8 KB. For pure reference counts, SKIP it.`,
-        "Do not duplicate work: if the trace op answered a symbol, do not look it up again.",
+
+    const toolStrategy = [
+        "Tool semantics — read carefully:",
+        "  - `code_localizer` with op=\"trace\" surfaces **runner-graph** matches: Make targets, shell scripts, CI workflow/job/step, and the build_target/ci_runner/script/module nodes that depend on the queried label. It does **not** do generic Go/TS function-caller search. Empty matches for a function name usually means \"no Make/CI/script directly references this label\" — that is a real, useful signal.",
+        "  - `repo_localizer` with view=\"overview\" returns subsystem layout + top files by edge count; use it once for orientation.",
+        "  - `doc_localizer` with op=\"search\" does BM25 search over markdown/rst sections; great for finding docs that mention a changed concept or a changed file path.",
+        "  - There is **no plain grep tool** in this server. If the runner-graph and doc-search both come up empty, the honest answer is empty arrays plus a note.",
+        "",
+        "Required call sequence (execute in this order, then stop):",
+        `  1. **repo_localizer**(path=${cwdJson}, view="overview"). ONE call. Look at top_files_by_edges to spot any OUT-OF-PR files clustered around the changed code.`,
+        `  2. **code_localizer**(path=${cwdJson}, op="trace", queries=<the trace candidates list below>). ONE call covers every candidate. Inspect each match's incoming/outgoing edges for runners/scripts/CI that depend on the changed files. Empty matches are fine — record them as zero refs.`,
+        `  3. **doc_localizer**(path=${cwdJson}, op="search", query=<changed file basename OR a concept term from the diff>, limit=5). Issue ONE call per distinct query (max 4 queries). Use it to find docs/READMEs that reference the changed files or concepts.`,
+        hasDocs
+            ? `  4. For every relative link [text](target) added in a changed doc file, call **doc_localizer**(path=${cwdJson}, op="resolve_link", source_file=<changed doc>, target=<link as written>). One call per added link.`
+            : "  4. (Skipped — no doc files in this PR.)",
     ];
-
-    const docFilesList = hasDocs ? docFiles.slice(0, 20).map((f) => `  - ${f}`).join("\n") : "";
-    const docToolBlock = hasDocs
-        ? [
-              "",
-              "**This PR touches documentation files:**",
-              docFilesList,
-              "",
-              "For EACH changed doc file you ALSO must determine:",
-              "  6. Up to 3 sibling pages that discuss the same concepts (so the reviewer can suggest cross-links).",
-              "  7. For every relative link `[text](target)` added in the diff: whether `target` resolves to a real file in the repo.",
-              "  8. For any prominent term/phrase introduced in the diff (a new heading, a new acronym): up to 3 other sections of the docs that already mention it.",
-              "",
-              "Use the doc-aware MCP tool — prefer it over raw search for prose lookup:",
-              `  - **doc_localizer** (path=${cwdJson}, op="search", query=<heading, paragraph, or single term>, limit=5) — BM25 over heading-delimited sections; lower score = better.`,
-              `  - **doc_localizer** (path=${cwdJson}, op="resolve_link", source_file=<changed doc>, target=<as-written link>) — verifies relative links. Call ONCE per added \`[text](target)\` link.`,
-              "",
-              "Record every doc finding in the `verified_docs` array.",
-          ]
-        : [];
-
-    const docsSchemaLine = hasDocs
-        ? '  "verified_docs":      [ { "source": str, "target_path": str, "target_section": str, "line": int, "kind": "related"|"anchor"|"term", "snippet": str } ],'
-        : '  "verified_docs":      [],';
 
     const prompt = [
         "You are the **repo-context** localizer for a code review. Your output is consumed programmatically — it must be a single JSON object.",
         "",
         `**The repo is checked out locally at: ${opts.cwd}**`,
-        "Files are on disk. Use the MCP tools to look at them. Do NOT invent paths or counts.",
         "",
-        "Files changed in this PR (these count as IN-PR; everything else is out-of-PR):",
+        "Files changed in this PR (IN-PR; everything else is out-of-PR):",
         fileLines,
         "",
         "Changed symbols (extracted from the diff):",
         symbolsList,
         "",
-        "Your job is to answer EXTRACTION questions about the repo that the PR diff alone cannot answer. The diff tells the reviewer what changed inside these files; you must tell the reviewer what those changes touch elsewhere.",
+        "Trace query candidates (file basenames + symbols — these are the labels code_localizer can match):",
+        traceList,
+        ...(hasDocs
+            ? [
+                  "",
+                  "Changed doc files:",
+                  ...docFiles.slice(0, 20).map((f) => `  - ${f}`),
+              ]
+            : []),
         "",
-        "For EACH changed symbol above you MUST determine, by issuing tool calls against the LOCAL repo:",
-        "  1. Total repo-wide reference count (an integer).",
-        "  2. Number of distinct OUT-OF-PR files that reference it (an integer).",
-        "  3. Up to 3 out-of-PR call-sites as { file, line, snippet }.",
-        "  4. Any test files (path matching /test/, /tests/, _test.*, .test.*, .spec.*) that reference it.",
-        "  5. Any config files (yaml/yml/toml/json/ini under config/, .github/, infra/) that reference it.",
+        "Your job: surface concrete OUT-OF-PR files and lines that the reviewer should also look at — runners (Make/CI/script targets) that depend on the changed files, related tests reachable through the runner graph, configs that mention the changed names, and docs that reference the changed concepts. Use ONLY the tool outputs you actually retrieve this turn. Never invent paths.",
         "",
-        ...codeToolBlock,
-        ...docToolBlock,
+        ...toolStrategy,
         "",
         "**Output: ONE JSON object inside a single ```json fenced block. No prose outside the block.** Schema:",
         "```",
         "{",
-        '  "verified_callsites": [ { "symbol": str, "file": str, "line": int, "snippet": str } ],',
-        '  "verified_tests":     [ { "symbol": str, "file": str, "line": int } ],',
-        '  "verified_configs":   [ { "symbol": str, "file": str, "line": int } ],',
-        docsSchemaLine,
-        '  "symbol_summary":     [ { "symbol": str, "total_refs": int, "out_of_pr_files": int } ],',
-        '  "notes":              str',
+        '  "verified_callsites": [ { "symbol": str, "file": str, "line": int, "snippet": str } ],   // out-of-PR runner / script / CI nodes that depend on the changed files (from code_localizer trace incoming/outgoing edges). The "symbol" field is the label that produced the match; "file" is the runner file path; "snippet" is the edge command if available.',
+        '  "verified_tests":     [ { "symbol": str, "file": str, "line": int } ],                   // out-of-PR test files surfaced by code_localizer (filenames matching /test/, /tests/, _test.*, .test.*, .spec.*).',
+        '  "verified_configs":   [ { "symbol": str, "file": str, "line": int } ],                   // out-of-PR config files (yaml/yml/toml/json/ini under config/, .github/, infra/, deploy/).',
+        '  "verified_docs":      [ { "source": str, "target_path": str, "target_section": str, "line": int, "kind": "related"|"anchor"|"term", "snippet": str } ],   // out-of-PR docs surfaced by doc_localizer search/resolve_link.',
+        '  "symbol_summary":     [ { "symbol": str, "total_refs": int, "out_of_pr_files": int } ], // one entry per changed symbol, with the counts you actually observed.',
+        '  "notes":              str  // short caveat (max 300 chars). Use this when every search returned empty so the reviewer knows it was checked.',
         "}",
         "```",
         "",
         "Hard rules:",
-        "- Every `file` in the verified arrays MUST be an out-of-PR path. Do NOT include the changed files listed above.",
-        "- Every entry MUST come from a tool call you actually issued this turn. The runtime records your tool calls separately — do not invent results.",
-        "- If a tool call returned zero matches for a symbol, leave the corresponding arrays empty for that symbol.",
-        hasDocs
-            ? "- For docs PRs: the `verified_docs` array MUST NOT be empty unless every doc-aware tool call returned zero matches."
-            : "- This PR has no doc files; `verified_docs` MUST be an empty array.",
-        "- Cap total bytes of the JSON to ~6 KB; truncate `verified_callsites` to the most informative entries if needed.",
-        "- `notes` is for short caveats only (max 300 chars).",
+        "- Every `file` and `target_path` in the verified arrays MUST be an out-of-PR path. Do NOT include any changed file listed above.",
+        "- Every entry MUST come from a tool call you actually issued this turn. The runtime separately records your tool calls — do not invent results.",
+        "- Empty arrays are valid and informative when the searches truly returned nothing — record that fact in `notes`.",
+        "- Cap total bytes of the JSON to ~6 KB.",
     ].join("\n");
 
     const t0 = Date.now();
