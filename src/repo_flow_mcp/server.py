@@ -105,15 +105,27 @@ def repo_localizer_entrypoints(
 
 @mcp.tool(
     description=(
-        "Trace a function/method name to the scripts, Make targets, and CI workflows "
-        "that invoke it (directly or through file bridges). Use this for change-impact "
-        "questions like \"where is X actually called from in production?\" or to find "
-        "the runbook path for a symbol. Replaces multi-step grep + view + bash chains: "
-        "one call returns code-symbol → file → script/workflow chains with line numbers. "
-        "\n\nSCOPE: only function, method, and class/type names with a body are indexed. "
-        "Struct fields, interface members, top-level const/var, type aliases, and any "
-        "plain identifier that is not the name of a defined function are NOT in the graph "
-        "and will return 0 matches — fall back to `grep` for those."
+        "Trace a function/method name OR a runner label (Make target, shell script, "
+        "GitHub Actions workflow / job / step) to its connected runners. Use this for "
+        "change-impact questions like \"where is X actually called from in production?\", "
+        "\"which CI job runs this Make target?\", or \"what does this workflow step "
+        "invoke?\". One call returns code-symbol → file → script/workflow chains with "
+        "line numbers, OR a runner node with its 1-hop incoming/outgoing edges — saving "
+        "a separate `code_localizer_node_context` round-trip."
+        "\n\nMatch shapes (per `match_kind`):"
+        "\n  - `code_symbol_chain`: legacy shape — { node, function, script_source, "
+        "invoked_script, bridge, command }"
+        "\n  - `ci_runner` (workflow / workflow_job / workflow_step): "
+        "{ node, incoming[], outgoing[] } where each edge row is "
+        "{ id, label, kind, path, edge_kind, command? }"
+        "\n  - `build_target` (Make target): same incoming/outgoing shape"
+        "\n  - `script` (shell script): same incoming/outgoing shape"
+        "\n  - `module` (imported library, GHA `uses:`, etc.): same incoming/outgoing shape"
+        "\n\nSCOPE: function/method/class names with a body, plus runner labels (Make "
+        "target names, workflow / job / step labels, script paths, GHA `uses:` actions) "
+        "are indexed. Struct fields, interface members, top-level const/var, type "
+        "aliases, and plain identifiers not defined as a symbol are NOT in the graph — "
+        "fall back to `grep` for those."
     )
 )
 def code_localizer_function_to_script(
@@ -264,15 +276,18 @@ def explain_runbook_path(
 @mcp.tool(
     description=(
         "BATCH version of `code_localizer_function_to_script`. Trace MANY function/method "
-        "names to their invoking scripts in ONE call — prefer this over issuing repeated "
-        "single-symbol calls when reviewing a PR that changes multiple symbols. Builds the "
-        "graph once (cached across calls in the same session) and returns one entry per "
-        "query, with a global cap on total chains so the response stays bounded for large "
-        "PRs (dozens of changed symbols). "
-        "\n\nSCOPE: same as the single-symbol variant — only function, method, and "
-        "class/type names with a body are indexed. Struct fields, interface members, "
-        "top-level const/var, type aliases, and renamed identifiers that are not function "
-        "definitions will return 0 matches; fall back to `grep` for those queries."
+        "names OR runner labels (Make targets, scripts, GHA workflow/job/step labels) to "
+        "their connected runners in ONE call — prefer this over issuing repeated "
+        "single-symbol calls when reviewing a PR that changes multiple symbols or CI "
+        "definitions. Builds the graph once (cached across calls in the same session) and "
+        "returns one entry per query, with a global cap on total chains so the response "
+        "stays bounded for large PRs."
+        "\n\nEach match has a `match_kind` field: `code_symbol_chain`, `ci_runner`, "
+        "`build_target`, `script`, or `module` — see the single-symbol tool for the per-"
+        "kind shape."
+        "\n\nSCOPE: same as the single-symbol variant. Plain identifiers that are not "
+        "defined symbols / runners (struct fields, interface members, top-level "
+        "const/var, type aliases) will return 0 matches; fall back to `grep` for those."
     )
 )
 def code_localizer_function_to_script_batch(

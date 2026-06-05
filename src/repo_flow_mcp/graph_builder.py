@@ -280,6 +280,12 @@ def function_to_script_chains(
     node_by_id = graph.nodes
     defines_file_for_symbol: dict[str, str] = {}
     invocations: list[tuple[str, str, str]] = []
+    # Per-node neighborhood for non-code matches (workflow jobs, Make
+    # targets, scripts, modules). Built lazily only when we have at
+    # least one such candidate so the common code-symbol query path
+    # stays cheap.
+    incoming_by_id: dict[str, list[tuple[str, str, str]]] | None = None
+    outgoing_by_id: dict[str, list[tuple[str, str, str]]] | None = None
 
     for edge in graph.edge_rows:
         if edge.kind.value == "defines" and edge.source.startswith("file:") and edge.target.startswith("code_symbol:"):
@@ -287,27 +293,42 @@ def function_to_script_chains(
         if edge.kind.value == "invokes" and edge.target.startswith("script:"):
             invocations.append((edge.source, edge.target, edge.metadata.get("command", "")))
 
-    # Pick candidate symbols using the FTS5 index when available; fall
-    # back to a full scan if the index is missing or returns nothing
-    # (e.g. for a query that doesn't tokenize cleanly). The fallback
-    # preserves the original substring-match semantics.
-    candidate_ids: list[str] = []
+    # Pick candidates using the FTS5 index when available; fall back
+    # to a full scan if the index is missing or returns nothing. The
+    # index now holds CODE_SYMBOL plus runner kinds (workflow / job /
+    # step / target / script / module), so a single search returns
+    # both the symbol-chain candidates and the CI/build-runner
+    # candidates we'll process below.
+    candidate_pairs: list[tuple[str, str]] = []
     if symbol_index is not None:
-        candidate_ids = [
-            sid for sid in symbol_index.search(function_query, limit=max(limit * 4, 64))
-            if sid in defines_file_for_symbol
-        ]
-    if not candidate_ids:
-        candidate_ids = [
-            sid for sid in defines_file_for_symbol
+        candidate_pairs = symbol_index.search_with_kinds(
+            function_query, limit=max(limit * 4, 64)
+        )
+    if not candidate_pairs:
+        # Legacy substring fallback over CODE_SYMBOL nodes only; this
+        # preserves prior behaviour when the index is empty.
+        candidate_pairs = [
+            (sid, "code_symbol")
+            for sid in defines_file_for_symbol
             if (
                 query in (node_by_id[sid].label.lower() if sid in node_by_id else "")
                 or query in sid.lower()
             )
         ]
 
+    code_candidate_ids = [
+        sid for sid, kind in candidate_pairs
+        if kind == "code_symbol" and sid in defines_file_for_symbol
+    ]
+    runner_candidate_ids = [
+        sid for sid, kind in candidate_pairs
+        if kind != "code_symbol" and sid in node_by_id
+    ]
+
     results: list[dict[str, object]] = []
-    for symbol_id in candidate_ids:
+
+    # --- Code-symbol -> script chain (legacy shape, kept verbatim) ---
+    for symbol_id in code_candidate_ids:
         file_path = defines_file_for_symbol.get(symbol_id)
         if file_path is None:
             continue
@@ -336,6 +357,13 @@ def function_to_script_chains(
 
             results.append(
                 {
+                    "match_kind": "code_symbol_chain",
+                    "node": {
+                        "id": symbol_id,
+                        "label": symbol.label,
+                        "kind": symbol.kind.value,
+                        "path": file_path,
+                    },
                     "function": {
                         "id": symbol_id,
                         "label": symbol.label,
@@ -359,5 +387,78 @@ def function_to_script_chains(
             )
             if len(results) >= limit:
                 return {"query": function_query, "matches": results}
+
+    # --- Runner matches (workflow / target / script / module) -------
+    # Same `matches[]` array, different shape: each entry exposes the
+    # matched node plus its 1-hop neighborhood, so the agent can
+    # answer "what runs this Make target?" or "what does this job
+    # invoke?" without a second tool call.
+    if runner_candidate_ids and (incoming_by_id is None or outgoing_by_id is None):
+        incoming_by_id = {}
+        outgoing_by_id = {}
+        for edge in graph.edge_rows:
+            outgoing_by_id.setdefault(edge.source, []).append(
+                (edge.target, edge.kind.value, edge.metadata.get("command", ""))
+            )
+            incoming_by_id.setdefault(edge.target, []).append(
+                (edge.source, edge.kind.value, edge.metadata.get("command", ""))
+            )
+
+    for runner_id in runner_candidate_ids:
+        if len(results) >= limit:
+            break
+        runner = node_by_id.get(runner_id)
+        if runner is None:
+            continue
+
+        def _resolve(other_id: str) -> dict[str, str]:
+            other = node_by_id.get(other_id)
+            if other is None:
+                return {"id": other_id, "label": other_id, "kind": "", "path": ""}
+            return {
+                "id": other.id,
+                "label": other.label,
+                "kind": other.kind.value,
+                "path": other.path or "",
+            }
+
+        incoming_rows: list[dict[str, object]] = []
+        for src, edge_kind, cmd in (incoming_by_id or {}).get(runner_id, [])[:20]:
+            row: dict[str, object] = {"edge_kind": edge_kind, **_resolve(src)}
+            if cmd:
+                row["command"] = cmd
+            incoming_rows.append(row)
+
+        outgoing_rows: list[dict[str, object]] = []
+        for dst, edge_kind, cmd in (outgoing_by_id or {}).get(runner_id, [])[:20]:
+            row = {"edge_kind": edge_kind, **_resolve(dst)}
+            if cmd:
+                row["command"] = cmd
+            outgoing_rows.append(row)
+
+        # match_kind classifies the runner so the agent can route
+        # straight to the right block (CI vs build-target vs module).
+        if runner.kind.value in {"workflow", "workflow_job", "workflow_step"}:
+            match_kind = "ci_runner"
+        elif runner.kind.value == "target":
+            match_kind = "build_target"
+        elif runner.kind.value == "script":
+            match_kind = "script"
+        else:
+            match_kind = "module"
+
+        results.append(
+            {
+                "match_kind": match_kind,
+                "node": {
+                    "id": runner.id,
+                    "label": runner.label,
+                    "kind": runner.kind.value,
+                    "path": runner.path or "",
+                },
+                "incoming": incoming_rows,
+                "outgoing": outgoing_rows,
+            }
+        )
 
     return {"query": function_query, "matches": results}

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from repo_flow_mcp.graph_cache import clear_cache, get_graph, get_symbol_index
+from repo_flow_mcp.models import NodeKind
 from repo_flow_mcp.symbol_index import SymbolIndex
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "repo_sample"
@@ -21,8 +22,8 @@ def test_symbol_index_finds_symbol_by_exact_token() -> None:
     graph = get_graph(str(FIXTURE_ROOT))
     index = get_symbol_index(str(FIXTURE_ROOT))
 
-    matches = index.search("main")
-    assert matches, "expected at least one match for 'main'"
+    matches = index.search("main", kinds=frozenset({NodeKind.CODE_SYMBOL}))
+    assert matches, "expected at least one code_symbol match for 'main'"
     for sid in matches:
         assert sid.startswith("code_symbol:")
         assert sid in graph.nodes
@@ -32,11 +33,11 @@ def test_symbol_index_supports_prefix_match() -> None:
     index = SymbolIndex()
     # Drop directly-shaped rows so we don't need a real graph.
     index._conn.executemany(
-        "INSERT INTO symbols(symbol_id, label, file) VALUES (?, ?, ?)",
+        "INSERT INTO symbols(symbol_id, kind, label, file) VALUES (?, ?, ?, ?)",
         [
-            ("code_symbol:a.py:build_graph", "build_graph", "a.py"),
-            ("code_symbol:b.py:build_router", "build_router", "b.py"),
-            ("code_symbol:c.py:run", "run", "c.py"),
+            ("code_symbol:a.py:build_graph", "code_symbol", "build_graph", "a.py"),
+            ("code_symbol:b.py:build_router", "code_symbol", "build_router", "b.py"),
+            ("code_symbol:c.py:run", "code_symbol", "run", "c.py"),
         ],
     )
 
