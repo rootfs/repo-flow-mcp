@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 from repo_flow_mcp.models import EdgeKind, GraphDocument, GraphEdge, GraphNode, NodeKind, make_node_id
+from repo_flow_mcp.parsers.code_parser_query import parse_with_tree_sitter_query
 from repo_flow_mcp.parsers.tree_sitter_parser import parse_with_tree_sitter
 
 JS_IMPORT_RE = re.compile(r"(?:import\s+.*?from\s+|require\()['\"]([^'\"]+)['\"]")
@@ -175,8 +176,11 @@ def _parse_cpp(rel_path: str, graph: GraphDocument, text: str) -> None:
 
 def parse_code_file(root: Path, rel_path: str, graph: GraphDocument, text: str) -> None:
     suffix = Path(rel_path).suffix.lower()
-    # Tree-sitter handles all supported languages uniformly; the legacy parsers
-    # below only run when a grammar fails to load or parse.
+    # Query-based tree-sitter is the primary path (pushes traversal into C);
+    # the recursive tree-sitter parser is the secondary fallback for grammars
+    # that don't satisfy the query API; legacy regex/ast parsers run last.
+    if parse_with_tree_sitter_query(rel_path, graph, text):
+        return
     if parse_with_tree_sitter(rel_path, graph, text):
         return
     if suffix == ".py":
