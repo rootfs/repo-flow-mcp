@@ -157,7 +157,8 @@ export async function runReview(opts: ReviewOptions): Promise<ReviewResult> {
         const llmCfg = resolveLlmConfig({ apiKey: ghToken, ...(opts.llm ?? {}) });
         const reviewerSystem =
             "You are a senior code reviewer. Be concrete, anchor every claim on a path:line, and never invent facts. " +
-            "When the localizer evidence is empty, say so explicitly and lower confidence on cross-file claims.";
+            "When the localizer evidence is empty, say so explicitly and lower confidence on cross-file claims. " +
+            "Always treat verified out-of-PR call-sites, tests, configs, and docs as the primary signal for what else may need to be updated alongside this PR.";
 
         // First turn: body + verdict (multi-batch concatenated for the LLM
         // call — this CLI does not maintain a stateful session, so we
@@ -334,8 +335,9 @@ function buildReviewBatches(
         "1. **Verdict** — one of `approve`, `comment`, `request_changes` on its own line, then a one-sentence rationale.",
         "2. **Risk** — breaking changes, API removals, schema/migration concerns. Anchor each on a `path:line`. If a risk is not anchored, drop it.",
         "3. **Tests** — coverage of touched paths, missing tests, related tests in the repo that should be updated.",
-        "4. **Style/Hygiene** — readability, dead code, naming. Brief.",
-        "5. **Size** — is the scope appropriate; suggest splits when warranted.",
+        "4. **Out-of-PR follow-ups** — concrete files and `path:line` locations OUTSIDE this PR that should also be updated (or at minimum re-checked) for the change to land safely. Pull these directly from the Repo context block: `verified_callsites` (callers that depend on the changed contract), `verified_tests` (tests that exercise the touched code), `verified_configs` (config or schema files that mention the touched names), `verified_docs` (docs/READMEs that describe the touched behavior). Group bullets under those four labels and write `(none from localizer evidence)` under any label whose list is empty. Do NOT invent paths — if the localizer surfaced nothing, say so and explain why this PR is therefore self-contained.",
+        "5. **Style/Hygiene** — readability, dead code, naming. Brief.",
+        "6. **Size** — is the scope appropriate; suggest splits when warranted.",
         "Be concrete. Cite specific lines as `path:line`. A follow-up turn collects inline comments separately.",
     ].join("\n");
 
