@@ -9,3 +9,6 @@ htmlcov/
 *.pyo
 *.pyd
 *.egg-info/
+mcp-client/node_modules/
+mcp-client/dist/
+mcp-client/*.log
